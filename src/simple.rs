@@ -25,6 +25,16 @@ impl<'a> System<'a> {
     pub fn alloc<T>(&'a self, a: T) -> &'a T {
         self.arena.alloc(a)
     }
+
+    pub fn run(&'a self) {
+        loop {
+            let item = self.callback_queue.borrow_mut().pop_front();
+            match item {
+                None => break,
+                Some(callback) => callback(),
+            }
+        }
+    }
 }
 
 pub fn with_system<'a, T>(f: impl FnOnce(&'a System<'a>) -> T) -> T {
@@ -37,7 +47,7 @@ pub fn with_system<'a, T>(f: impl FnOnce(&'a System<'a>) -> T) -> T {
 }
 
 pub trait RelMeta<'a, T: Row> {
-    fn iter_values(&'a self, f: &dyn Fn(&T) -> ());
+    fn iter_values(&'a self, f: &mut dyn FnMut(&T) -> ());
 }
 
 pub struct RelImpl<'a, T> {
@@ -45,12 +55,27 @@ pub struct RelImpl<'a, T> {
     listeners: RefCell<Vec<&'a dyn Listener<'a, T>>>,
 }
 
-pub struct Rel<'a, T> {
+pub struct Rel<'a, T: Row> {
     rel_impl: &'a RelImpl<'a, T>,
     pub meta: &'a dyn RelMeta<'a, T>,
 }
 
-impl<'a, T> Clone for Rel<'a, T> {
+impl<'a, T: Row> Rel<'a, T> {
+    pub fn to_vec(self) -> Vec<T> {
+        let mut result = Vec::new();
+        self.meta.iter_values(&mut |val| result.push(val.clone()));
+        result
+    }
+}
+
+impl<'a, T: Row + Ord> Rel<'a, T> {
+    pub fn to_sorted_vec(self) -> Vec<T> {
+        let mut result = self.to_vec();
+        result.sort();
+        result
+    }
+}
+impl<'a, T: Row> Clone for Rel<'a, T> {
     fn clone(&self) -> Self {
         Rel {
             rel_impl: self.rel_impl,
@@ -59,7 +84,7 @@ impl<'a, T> Clone for Rel<'a, T> {
     }
 }
 
-impl<'a, T> Copy for Rel<'a, T> {}
+impl<'a, T: Row> Copy for Rel<'a, T> {}
 
 impl<'a, T: Row> RelImpl<'a, T> {
     pub fn new(sys: &'a System<'a>) -> &'a RelImpl<'a, T> {
@@ -107,7 +132,7 @@ pub struct DataRel<'a, T: Row> {
 }
 
 impl<'a, T: Row> RelMeta<'a, T> for DataRel<'a, T> {
-    fn iter_values(&'a self, f: &dyn Fn(&T) -> ()) {
+    fn iter_values(&'a self, f: &mut dyn FnMut(&T) -> ()) {
         for (k, ()) in self.vals.borrow().iter() {
             f(k);
         }
@@ -180,7 +205,7 @@ impl<'a, T: Row> Listener<'a, T> for MemoRel<'a, T> {
 }
 
 impl<'a, T: Row> RelMeta<'a, T> for MemoRel<'a, T> {
-    fn iter_values(&'a self, f: &dyn Fn(&T) -> ()) {
+    fn iter_values(&'a self, f: &mut dyn FnMut(&T) -> ()) {
         for (k, count) in self.vals.borrow().iter() {
             if *count != 0 {
                 f(k);
@@ -189,7 +214,7 @@ impl<'a, T: Row> RelMeta<'a, T> for MemoRel<'a, T> {
     }
 }
 
-pub fn memo<'a, T: Row>(sys: &'a System<'a>, rel: &'a Rel<'a, T>) -> Rel<'a, T> {
+pub fn memo<'a, T: Row>(sys: &'a System<'a>, rel: Rel<'a, T>) -> Rel<'a, T> {
     let result = RelImpl::new(sys);
     let this = sys.arena.alloc(MemoRel {
         rel: result,
@@ -199,7 +224,7 @@ pub fn memo<'a, T: Row>(sys: &'a System<'a>, rel: &'a Rel<'a, T>) -> Rel<'a, T> 
     result.with_meta(this)
 }
 
-struct MapRel<'a, T, R> {
+struct MapRel<'a, T: Row, R: Row> {
     rel: Rel<'a, T>,
     result: &'a RelImpl<'a, R>,
     f: &'a dyn Fn(T) -> R,
@@ -212,8 +237,8 @@ impl<'a, T: Row, R: Row> Listener<'a, T> for MapRel<'a, T, R> {
 }
 
 impl<'a, T: Row, R: Row> RelMeta<'a, R> for MapRel<'a, T, R> {
-    fn iter_values(&'a self, f: &dyn Fn(&R) -> ()) {
-        self.rel.meta.iter_values(&|val| {
+    fn iter_values(&'a self, f: &mut dyn FnMut(&R) -> ()) {
+        self.rel.meta.iter_values(&mut |val| {
             f(&(self.f)(val.clone()));
         })
     }
@@ -306,7 +331,7 @@ impl<'a, A: Row, B: Row, K: Row> Listener<'a, B> for JoinRelB<'a, A, B, K> {
 }
 
 impl<'a, A: Row, B: Row, K: Row> RelMeta<'a, (A, B)> for JoinRel<'a, A, B, K> {
-    fn iter_values(&'a self, f: &dyn Fn(&(A, B)) -> ()) {
+    fn iter_values(&'a self, f: &mut dyn FnMut(&(A, B)) -> ()) {
         for (key, values_a) in self.val_a.borrow().iter() {
             match self.val_b.borrow().get(&key) {
                 None => (),
