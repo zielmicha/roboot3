@@ -9,18 +9,19 @@ use std::rc::{Rc, Weak};
 
 struct ByPointer<T>(*const T);
 
-struct RInner<T> {
-    inner: T,
+struct RInner<T: ?Sized> {
     destructors: RefCell<HashMap<ByPointer<c_void>, Box<dyn Destructor<T>>>>,
+    inner: Box<T>,
 }
 
-pub struct R<T>(Rc<RInner<T>>);
+#[derive(Clone)]
+pub struct R<T: ?Sized>(Rc<RInner<T>>);
 
-impl<T> R<T> {
-    pub fn new(t: T) -> Self {
+impl<T: ?Sized> R<T> {
+    pub fn new(t: Box<T>) -> Self {
         R(Rc::new(RInner {
-            inner: t,
             destructors: RefCell::new(HashMap::new()),
+            inner: t,
         }))
     }
 }
@@ -33,7 +34,7 @@ impl<T> Deref for R<T> {
     }
 }
 
-trait Destructor<T> {
+trait Destructor<T: ?Sized> {
     fn destruct(&self, r: &RInner<T>);
 }
 
@@ -50,7 +51,7 @@ impl<T> RInner<T> {
     }
 }
 
-impl<T> Drop for RInner<T> {
+impl<T: ?Sized> Drop for RInner<T> {
     fn drop(&mut self) {
         for (_, d) in self.destructors.borrow_mut().iter() {
             d.destruct(self);
@@ -74,7 +75,7 @@ impl<T> Hash for ByPointer<T> {
 struct ExpandoInner<T: 'static, K: 'static, V: 'static> {
     this: Weak<RInner<T>>,
     on_remove: (&'static dyn Fn(R<T>, V) -> ()),
-    items: RefCell<HashMap<ByPointer<RInner<K>>, V>>,
+    items: RefCell<HashMap<ByPointer<RInner<K>>, (V, Weak<RInner<K>>)>>,
 }
 
 unsafe fn to_addr<T>(p: &Pin<Box<T>>) -> *mut T {
@@ -100,7 +101,7 @@ impl<T, K, V> Destructor<K> for *mut ExpandoInner<T, K, V> {
         match items.entry(ByPointer(r)) {
             Entry::Vacant(_) => panic!("destructing value that was not set (?)"),
             Entry::Occupied(entry) => {
-                let (_, v) = entry.remove_entry();
+                let (_, (v, _)) = entry.remove_entry();
                 match self_ref.this.upgrade() {
                     Some(this_strong) => (self_ref.on_remove)(R(this_strong), v),
                     None => (),
@@ -111,14 +112,19 @@ impl<T, K, V> Destructor<K> for *mut ExpandoInner<T, K, V> {
 }
 
 impl<T, K, V> Expando<T, K, V> {
-    fn add_destructor_callback(&self, a: R<K>) {
-        unsafe {
-            a.0.add_destructor(to_cvoid(to_addr(&self.0)), Box::new(to_addr(&self.0)))
-        }
+    fn add_destructor_callback(&self, a: &RInner<K>) {
+        unsafe { a.add_destructor(to_cvoid(to_addr(&self.0)), Box::new(to_addr(&self.0))) }
     }
 
     fn remove_destructor_callback(&self, a: &RInner<K>) {
         unsafe { a.remove_destructor(to_cvoid(to_addr(&self.0))) }
+    }
+
+    pub fn iter(&self, cb: &mut dyn FnMut(R<K>, &V) -> ()) {
+        let items = self.0.items.borrow();
+        for (_, (v, weak_ref)) in items.iter() {
+            cb(R(weak_ref.upgrade().unwrap()), v)
+        }
     }
 
     pub fn add(&self, a: R<K>, value: V) {
@@ -126,11 +132,11 @@ impl<T, K, V> Expando<T, K, V> {
         let key = ByPointer(unsafe { to_addr_rc(&a.0) });
         match items.entry(key) {
             Entry::Vacant(entry) => {
-                self.add_destructor_callback(a);
-                entry.insert(value);
+                self.add_destructor_callback(&a.0);
+                entry.insert((value, Rc::downgrade(&a.0)));
             }
             Entry::Occupied(mut entry) => {
-                entry.insert(value);
+                entry.insert((value, Rc::downgrade(&a.0)));
             }
         }
     }
