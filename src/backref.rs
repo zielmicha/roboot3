@@ -10,11 +10,10 @@ use std::rc::{Rc, Weak};
 struct ByPointer<T>(*const T);
 
 struct RInner<T: ?Sized> {
-    destructors: RefCell<HashMap<ByPointer<c_void>, Box<dyn Destructor<T>>>>,
+    destructors: RefCell<HashMap<ByPointer<c_void>, Box<dyn Destructor>>>,
     inner: Box<T>,
 }
 
-#[derive(Clone)]
 pub struct R<T: ?Sized>(Rc<RInner<T>>);
 
 impl<T: ?Sized> R<T> {
@@ -26,7 +25,13 @@ impl<T: ?Sized> R<T> {
     }
 }
 
-impl<T> Deref for R<T> {
+impl<T: ?Sized> Clone for R<T> {
+    fn clone(&self) -> Self {
+        R(self.0.clone())
+    }
+}
+
+impl<T: ?Sized> Deref for R<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -34,12 +39,12 @@ impl<T> Deref for R<T> {
     }
 }
 
-trait Destructor<T: ?Sized> {
-    fn destruct(&self, r: &RInner<T>);
+trait Destructor {
+    fn destruct(&self, r: ByPointer<c_void>);
 }
 
-impl<T> RInner<T> {
-    fn add_destructor(&self, k: *const c_void, d: Box<dyn Destructor<T>>) {
+impl<T: ?Sized> RInner<T> {
+    fn add_destructor(&self, k: *const c_void, d: Box<dyn Destructor>) {
         self.destructors
             .borrow_mut()
             .entry(ByPointer(k))
@@ -53,8 +58,10 @@ impl<T> RInner<T> {
 
 impl<T: ?Sized> Drop for RInner<T> {
     fn drop(&mut self) {
+        let self_ref: &Self = &*self;
+        let self_ptr: *const c_void = unsafe { std::mem::transmute(self_ref) };
         for (_, d) in self.destructors.borrow_mut().iter() {
-            d.destruct(self);
+            d.destruct(ByPointer(self_ptr));
         }
     }
 }
@@ -72,33 +79,33 @@ impl<T> Hash for ByPointer<T> {
     }
 }
 
-struct ExpandoInner<T: 'static, K: 'static, V: 'static> {
+struct ExpandoInner<T: 'static, K: 'static + ?Sized, V: 'static> {
     this: Weak<RInner<T>>,
     on_remove: (&'static dyn Fn(R<T>, V) -> ()),
-    items: RefCell<HashMap<ByPointer<RInner<K>>, (V, Weak<RInner<K>>)>>,
+    items: RefCell<HashMap<ByPointer<c_void>, (V, Weak<RInner<K>>)>>,
 }
 
-unsafe fn to_addr<T>(p: &Pin<Box<T>>) -> *mut T {
+unsafe fn to_addr<T: ?Sized>(p: &Pin<Box<T>>) -> *mut T {
     let m: &T = &*p;
-    std::mem::transmute(m)
+    m as *const T as *mut T
 }
 
-unsafe fn to_addr_rc<T>(p: &Rc<T>) -> *mut T {
+unsafe fn to_addr_rc<T: ?Sized>(p: &Rc<T>) -> *mut T {
     let m: &T = &*p;
-    std::mem::transmute(m)
+    m as *const T as *mut T
 }
 
-unsafe fn to_cvoid<T>(t: *mut T) -> *const c_void {
-    std::mem::transmute(t)
+unsafe fn to_cvoid<T>(t: *const T) -> *const c_void {
+    t as *const c_void
 }
 
-pub struct Expando<T: 'static, K: 'static, V: 'static>(Pin<Box<ExpandoInner<T, K, V>>>);
+pub struct Expando<T: 'static, K: 'static + ?Sized, V: 'static>(Pin<Box<ExpandoInner<T, K, V>>>);
 
-impl<T, K, V> Destructor<K> for *mut ExpandoInner<T, K, V> {
-    fn destruct(&self, r: &RInner<K>) {
+impl<T, K: ?Sized, V> Destructor for *mut ExpandoInner<T, K, V> {
+    fn destruct(&self, r: ByPointer<c_void>) {
         let self_ref = unsafe { &**self };
         let mut items = self_ref.items.borrow_mut();
-        match items.entry(ByPointer(r)) {
+        match items.entry(r) {
             Entry::Vacant(_) => panic!("destructing value that was not set (?)"),
             Entry::Occupied(entry) => {
                 let (_, (v, _)) = entry.remove_entry();
@@ -111,12 +118,12 @@ impl<T, K, V> Destructor<K> for *mut ExpandoInner<T, K, V> {
     }
 }
 
-impl<T, K, V> Expando<T, K, V> {
+impl<T, K: ?Sized, V> Expando<T, K, V> {
     fn add_destructor_callback(&self, a: &RInner<K>) {
         unsafe { a.add_destructor(to_cvoid(to_addr(&self.0)), Box::new(to_addr(&self.0))) }
     }
 
-    fn remove_destructor_callback(&self, a: &RInner<K>) {
+    fn remove_destructor_callback(&self, a: Rc<RInner<K>>) {
         unsafe { a.remove_destructor(to_cvoid(to_addr(&self.0))) }
     }
 
@@ -129,7 +136,7 @@ impl<T, K, V> Expando<T, K, V> {
 
     pub fn add(&self, a: R<K>, value: V) {
         let mut items = self.0.items.borrow_mut();
-        let key = ByPointer(unsafe { to_addr_rc(&a.0) });
+        let key = ByPointer(unsafe { to_cvoid(to_addr_rc(&a.0)) });
         match items.entry(key) {
             Entry::Vacant(entry) => {
                 self.add_destructor_callback(&a.0);
@@ -151,11 +158,11 @@ impl<T, K, V> Expando<T, K, V> {
     }
 }
 
-impl<T, K, V> Drop for Expando<T, K, V> {
+impl<T, K: ?Sized, V> Drop for Expando<T, K, V> {
     fn drop(&mut self) {
         let items = (*self).0.items.borrow();
-        for (key, _) in items.iter() {
-            self.remove_destructor_callback(unsafe { &*(key.0) })
+        for (_, (_, weak)) in items.iter() {
+            self.remove_destructor_callback(Weak::upgrade(weak).unwrap())
         }
     }
 }
