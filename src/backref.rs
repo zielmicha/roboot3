@@ -166,3 +166,8 @@ impl<T, K: ?Sized, V> Drop for Expando<T, K, V> {
         }
     }
 }
+
+// pub struct CallbackExpando<T: 'static, ArgType>();
+// impl<T: 'static, ArgType> CallbackExpando<T, ArgType> {
+//     pub fn add_callback() {}
+// }

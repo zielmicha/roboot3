@@ -91,7 +91,7 @@ impl<'a, T: Row + Ord> Rel<T> {
 }
 
 impl<T: Row> Rel<T> {
-    pub fn add_listener(&self, listener: R<dyn Listener<T>>) {
+    fn add_listener(&self, listener: R<dyn Listener<T>>) {
         self.0.get_listeners().mapping.add(listener, ());
     }
 }
@@ -126,6 +126,7 @@ pub mod memo_rel {
 
     impl<T: Row> Listener<T> for MemoRelImpl<T> {
         fn on_delta(&self, t: &T, delta: i64) {
+            println!("memorel/delta");
             // TOOD: remove if zero
             assert!(delta != 0);
             let mut vals_mut = self.0.vals.borrow_mut();
@@ -146,6 +147,9 @@ pub mod memo_rel {
             listeners: Listeners::new(sys),
             vals: RefCell::new(HashMap::new()),
         }));
+        rel.iter_values(&mut |value| {
+            MemoRelImpl(self_rel.clone()).on_delta(value, 1);
+        });
         rel.clone()
             .add_listener(R::new(Box::new(MemoRelImpl(self_rel.clone()))));
         Rel(Rc::new(MemoRelImpl(self_rel)))
@@ -245,6 +249,14 @@ pub mod map_rel {
         }
     }
 
+    impl<T: Row, TR: Row> Listener<T> for MapRelImpl<T, TR> {
+        fn on_delta(&self, t: &T, delta: i64) {
+            println!("maprel/delta");
+            let mapped_value = (self.0.f)(t);
+            self.0.listeners.clone().delta(mapped_value, delta);
+        }
+    }
+
     pub fn new<T: Row, TR: Row>(
         sys: Rc<System>,
         rel: &Rel<T>,
@@ -255,7 +267,8 @@ pub mod map_rel {
             rel: rel.clone(),
             f,
         }));
-        let rel = Rel(Rc::new(MapRelImpl(self_rel.clone())));
-        rel
+        rel.clone()
+            .add_listener(R::new(Box::new(MapRelImpl(self_rel.clone()))));
+        Rel(Rc::new(MapRelImpl(self_rel.clone())))
     }
 }
