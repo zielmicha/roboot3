@@ -15,32 +15,36 @@ struct AnyBox {
     drop_fn: unsafe fn(*mut c_void) -> (),
 }
 
-unsafe fn drop_box<T: ?Sized>(p: *mut c_void) {
+unsafe fn drop_box<T>(p: *mut c_void) {
     let p_typed: *mut T = p as *mut T;
     drop(Box::from_raw(p_typed));
 }
 
 impl AnyBox {
-    unsafe fn new<T: ?Sized>(val: Box<T>) -> AnyBox {
-        let box_ptr: *mut T = Box::into_raw(val);
-        AnyBox {
-            box_ptr: std::mem::transmute(box_ptr),
-            drop_fn: (drop_box::<T>),
+    fn new<T>(val: Box<T>) -> AnyBox {
+        unsafe {
+            let box_ptr: *mut T = Box::into_raw(val);
+            AnyBox {
+                box_ptr: std::mem::transmute(box_ptr),
+                drop_fn: (drop_box::<T>),
+            }
         }
     }
 
-    unsafe fn borrow<T: ?Sized>(&self) -> &T {
+    unsafe fn borrow<T>(&self) -> &T {
         std::mem::transmute(self.box_ptr)
     }
 
-    unsafe fn borrow_mut<T: ?Sized>(&mut self) -> &mut T {
+    unsafe fn borrow_mut<T>(&mut self) -> &mut T {
         std::mem::transmute(self.box_ptr)
     }
 }
 
 impl Drop for AnyBox {
     fn drop(&mut self) {
-        (self.drop_fn)(self.box_ptr);
+        unsafe {
+            (self.drop_fn)(self.box_ptr);
+        }
     }
 }
 
@@ -49,9 +53,9 @@ struct RInner {
     inner: AnyBox,
 }
 
-pub struct R<T: ?Sized>(Rc<RInner>, PhantomData<T>);
+pub struct R<T>(Rc<RInner>, PhantomData<T>);
 
-impl<T: ?Sized> R<T> {
+impl<T> R<T> {
     pub fn new(t: Box<T>) -> Self {
         R::<T>(
             Rc::new(RInner {
@@ -63,17 +67,17 @@ impl<T: ?Sized> R<T> {
     }
 }
 
-impl<T: ?Sized> Clone for R<T> {
+impl<T> Clone for R<T> {
     fn clone(&self) -> Self {
         R(self.0.clone(), PhantomData)
     }
 }
 
-impl<T: ?Sized> Deref for R<T> {
+impl<T> Deref for R<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.0.inner.borrow()
+        unsafe { self.0.inner.borrow() }
     }
 }
 
@@ -123,12 +127,12 @@ struct ExpandoInner<T: 'static, V: 'static> {
     items: RefCell<HashMap<ByPointer<c_void>, (V, Weak<RInner>)>>,
 }
 
-unsafe fn to_addr<T: ?Sized>(p: &Pin<Box<T>>) -> *mut T {
+unsafe fn to_addr<T>(p: &Pin<Box<T>>) -> *mut T {
     let m: &T = &*p;
     m as *const T as *mut T
 }
 
-unsafe fn to_addr_rc<T: ?Sized>(p: &Rc<T>) -> *mut T {
+unsafe fn to_addr_rc<T>(p: &Rc<T>) -> *mut T {
     let m: &T = &*p;
     m as *const T as *mut T
 }
@@ -210,7 +214,7 @@ impl<T, V> ExpandoBase<T, Vec<V>> {
     pub fn add_multi(&self, a: Rc<RInner>, value: V) {
         self.update(a, |old_value| match old_value {
             None => vec![value],
-            Some(l) => {
+            Some(mut l) => {
                 l.push(value);
                 l
             }
@@ -227,24 +231,22 @@ impl<T, V> Drop for ExpandoBase<T, V> {
     }
 }
 
-struct CallbackEntry<T, ArgType> {
-    invoker: unsafe fn(*const c_void, R<T>, Rc<RInner>, &ArgType) -> (),
+struct CallbackEntry<ArgType> {
+    invoker: unsafe fn(*const c_void, Rc<RInner>, &ArgType) -> (),
     fun_ptr: *const c_void,
 }
 
-pub struct CallbackExpando<T: 'static, ArgType: 'static>(
-    ExpandoBase<T, Vec<CallbackEntry<T, ArgType>>>,
-);
+pub struct CallbackExpando<ArgType: 'static>(ExpandoBase<(), Vec<CallbackEntry<ArgType>>>);
 
-unsafe fn invoker<T, K, ArgType>(fun_ptr: *const c_void, t: R<T>, key: Rc<RInner>, arg: &ArgType) {
-    let fun_ptr: (fn(R<T>, R<K>, &ArgType) -> ()) = std::mem::transmute(fun_ptr);
-    fun_ptr(t, R::<K>(key, PhantomData), arg)
+unsafe fn invoker<K, ArgType>(fun_ptr: *const c_void, key: Rc<RInner>, arg: &ArgType) {
+    let fun_ptr: (fn(R<K>, &ArgType) -> ()) = std::mem::transmute(fun_ptr);
+    fun_ptr(R::<K>(key, PhantomData), arg)
 }
 
-impl<T: 'static, ArgType> CallbackExpando<T, ArgType> {
-    pub fn add_callback<K>(&self, key: R<K>, f: fn(R<T>, R<K>, &ArgType) -> ()) {
+impl<ArgType> CallbackExpando<ArgType> {
+    pub fn add_callback<K>(&self, key: R<K>, f: fn(R<K>, &ArgType) -> ()) {
         let value = CallbackEntry {
-            invoker: (invoker::<T, K, ArgType>),
+            invoker: (invoker::<K, ArgType>),
             fun_ptr: unsafe { std::mem::transmute(f) },
         };
 
@@ -254,12 +256,14 @@ impl<T: 'static, ArgType> CallbackExpando<T, ArgType> {
     pub fn call(&self, arg: &ArgType) {
         self.0.iter(&mut |k, v| {
             for entry in v {
-                (entry.invoker)(entry.fun_ptr, self.0.get_this(), k, arg);
+                unsafe {
+                    (entry.invoker)(entry.fun_ptr, k.clone(), arg);
+                }
             }
         });
     }
 
-    pub fn new(this: R<T>) -> Self {
-        CallbackExpando(ExpandoBase::new(this, &|_, _| {}))
+    pub fn new() -> Self {
+        CallbackExpando(ExpandoBase::new(R::new(Box::new(())), &|_, _| {}))
     }
 }

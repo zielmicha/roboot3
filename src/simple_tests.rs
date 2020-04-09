@@ -18,6 +18,6 @@ mod tests {
         sys.run();
         assert_eq!(d2.clone().to_sorted_vec(), vec![2, 3, 4, 6]);
         assert_eq!(d3.clone().to_sorted_vec(), vec![1, 1, 2, 3]);
-        //assert_eq!(d3memo.clone().to_sorted_vec(), vec![1, 2, 3])
+        assert_eq!(d3memo.clone().to_sorted_vec(), vec![1, 2, 3])
     }
 }
