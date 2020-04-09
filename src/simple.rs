@@ -5,10 +5,6 @@ use std::rc::Rc;
 use super::backref::*;
 use super::common::*;
 
-trait Listener<T> {
-    fn on_delta(&self, t: &T, delta: i64);
-}
-
 pub struct System {
     callback_queue: RefCell<VecDeque<Box<dyn FnOnce() -> ()>>>,
 }
@@ -33,25 +29,21 @@ impl System {
 
 pub struct Listeners<T: Row> {
     sys: Rc<System>,
-    mapping: Expando<(), dyn Listener<T>, ()>,
+    mapping: CallbackExpando<(), (T, i64)>,
 }
 
 impl<T: Row> Listeners<T> {
     fn new(sys: Rc<System>) -> Rc<Listeners<T>> {
         Rc::new(Listeners {
             sys,
-            mapping: Expando::new(R::new(Box::new(())), &|_, _| ()),
+            mapping: CallbackExpando::new(R::new(Box::new(()))),
         })
     }
 
     fn delta(self: Rc<Listeners<T>>, t: T, delta: i64) {
         let self1 = self.clone();
         let impl_delta_cb = move || {
-            self1
-                .mapping
-                .iter(&mut |listener: R<dyn Listener<T>>, &()| {
-                    listener.on_delta(&t, delta);
-                })
+            self.mapping.call(&(t, delta));
         };
 
         self.sys
@@ -80,6 +72,10 @@ impl<T: Row> Rel<T> {
         self.iter_values(&mut |val| result.push(val.clone()));
         result
     }
+
+    pub fn add_listener<A>(&self, this: R<A>, f: fn(R<()>, R<A>, &(T, i64)) -> ()) {
+        self.0.get_listeners().mapping.add_callback(this, f);
+    }
 }
 
 impl<'a, T: Row + Ord> Rel<T> {
@@ -87,12 +83,6 @@ impl<'a, T: Row + Ord> Rel<T> {
         let mut result = self.to_vec();
         result.sort();
         result
-    }
-}
-
-impl<T: Row> Rel<T> {
-    fn add_listener(&self, listener: R<dyn Listener<T>>) {
-        self.0.get_listeners().mapping.add(listener, ());
     }
 }
 
@@ -124,21 +114,21 @@ pub mod memo_rel {
         }
     }
 
-    impl<T: Row> Listener<T> for MemoRelImpl<T> {
-        fn on_delta(&self, t: &T, delta: i64) {
-            println!("memorel/delta");
-            // TOOD: remove if zero
-            assert!(delta != 0);
-            let mut vals_mut = self.0.vals.borrow_mut();
-            let current_count = vals_mut.entry(t.clone()).or_insert(0);
-            let is_added = *current_count == 0;
-            *current_count += delta;
-            let is_removed = *current_count == 0;
-            if is_added {
-                self.0.listeners.clone().delta(t.clone(), 1);
-            } else if is_removed {
-                self.0.listeners.clone().delta(t.clone(), -1);
-            }
+    fn on_delta<T: Row>(_: R<()>, this: R<MemoRel<T>>, x: &(T, i64)) {
+        let (t, delta) = x;
+        let delta = *delta;
+        println!("memorel/delta");
+        // TOOD: remove if zero
+        assert!(delta != 0);
+        let mut vals_mut = this.vals.borrow_mut();
+        let current_count = vals_mut.entry(t.clone()).or_insert(0);
+        let is_added = *current_count == 0;
+        *current_count += delta;
+        let is_removed = *current_count == 0;
+        if is_added {
+            this.listeners.clone().delta(t.clone(), 1);
+        } else if is_removed {
+            this.listeners.clone().delta(t.clone(), -1);
         }
     }
 
@@ -148,10 +138,9 @@ pub mod memo_rel {
             vals: RefCell::new(HashMap::new()),
         }));
         rel.iter_values(&mut |value| {
-            MemoRelImpl(self_rel.clone()).on_delta(value, 1);
+            on_delta(R::new(Box::new(())), self_rel, &(value.clone(), 1));
         });
-        rel.clone()
-            .add_listener(R::new(Box::new(MemoRelImpl(self_rel.clone()))));
+        rel.clone().add_listener(self_rel, on_delta);
         Rel(Rc::new(MemoRelImpl(self_rel)))
     }
 }
@@ -249,12 +238,11 @@ pub mod map_rel {
         }
     }
 
-    impl<T: Row, TR: Row> Listener<T> for MapRelImpl<T, TR> {
-        fn on_delta(&self, t: &T, delta: i64) {
-            println!("maprel/delta");
-            let mapped_value = (self.0.f)(t);
-            self.0.listeners.clone().delta(mapped_value, delta);
-        }
+    fn on_delta<T: Row, TR: Row>(_: R<()>, this: R<MapRel<T, TR>>, x: &(T, i64)) {
+        let (t, delta) = x;
+        let delta = *delta;
+        let mapped_value = (this.f)(t);
+        this.listeners.clone().delta(mapped_value, delta);
     }
 
     pub fn new<T: Row, TR: Row>(
@@ -267,8 +255,7 @@ pub mod map_rel {
             rel: rel.clone(),
             f,
         }));
-        rel.clone()
-            .add_listener(R::new(Box::new(MapRelImpl(self_rel.clone()))));
+        rel.clone().add_listener(self_rel, on_delta);
         Rel(Rc::new(MapRelImpl(self_rel.clone())))
     }
 }
